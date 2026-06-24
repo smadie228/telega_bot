@@ -338,8 +338,13 @@ async def update_name_in_sheet(old_name: str, new_name: str) -> None:
 async def init_db() -> None:
     """Инициализирует базу SQLite."""
     async with aiosqlite.connect("users.db") as db:
-        await db.execute(
-        )
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                registered_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
 
@@ -1479,6 +1484,10 @@ def main() -> None:
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
         .post_init(on_startup)
+        .connect_timeout(60)
+        .read_timeout(60)
+        .write_timeout(60)
+        .pool_timeout(60)
         .build()
     )
 
@@ -1538,7 +1547,14 @@ def main() -> None:
 
     application.add_handler(CommandHandler("help", help_command))
 
-    application.run_polling()
+    application.run_polling(
+        drop_pending_updates=True,
+        timeout=60,
+        read_timeout=60,
+        write_timeout=60,
+        connect_timeout=60,
+        pool_timeout=60,
+    )
 
 
 if __name__ == "__main__":

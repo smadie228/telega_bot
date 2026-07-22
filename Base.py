@@ -6,6 +6,8 @@ import logging
 import asyncio
 import concurrent.futures
 import hashlib
+import fcntl
+import atexit
 from datetime import datetime, timedelta, date, time
 from functools import wraps
 
@@ -54,10 +56,9 @@ def resource_path(relative_path: str) -> str:
 
 
 
-TELEGRAM_TOKEN = os.getenv(
-    "TELEGRAM_BOT_TOKEN",
-    "8047200746:AAHI8fMpGPG41CfXj3hk6g6lqMsmZs_bG4A"
-)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","8047200746:AAHI8fMpGPG41CfXj3hk6g6lqMsmZs_bG4A")
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("Не задана переменная окружения TELEGRAM_BOT_TOKEN")
 
 SERVICE_ACCOUNT_FILE = resource_path("service_account.json")
 
@@ -103,6 +104,10 @@ admin_sessions: set[int] = set()
 admin_password_pending: set[int] = set()
 user_sessions: dict[int, dict] = {}
 remind_settings: dict[int, bool] = {}
+reminder_tasks: dict[int, asyncio.Task] = {}
+
+scheduler: AsyncIOScheduler | None = None
+_instance_lock_file = None
 
 
 REGISTER_NAME, CHANGE_NAME = range(2)
@@ -112,6 +117,40 @@ MORNING_MESSAGE = (
     "☀️ Всем доброго дня!) Записываемся на занятия:\n"
     "https://docs.google.com/spreadsheets/d/1Z39dIQrgdhSoWdD5AE9jIMtfn1ahTxl-femjqxyER0Q/edit?gid=765012037#gid=765012037"
 )
+
+
+def acquire_instance_lock() -> None:
+    """Не даёт запустить одновременно несколько экземпляров бота."""
+    global _instance_lock_file
+
+    lock_path = os.getenv("BOT_LOCK_FILE", "/tmp/telegram-bot.lock")
+    _instance_lock_file = open(lock_path, "w", encoding="utf-8")
+
+    try:
+        fcntl.flock(_instance_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        raise RuntimeError(
+            f"Другой экземпляр бота уже запущен. Файл блокировки: {lock_path}"
+        ) from exc
+
+    _instance_lock_file.seek(0)
+    _instance_lock_file.truncate()
+    _instance_lock_file.write(str(os.getpid()))
+    _instance_lock_file.flush()
+
+
+def release_instance_lock() -> None:
+    global _instance_lock_file
+    if _instance_lock_file is None:
+        return
+    try:
+        fcntl.flock(_instance_lock_file.fileno(), fcntl.LOCK_UN)
+    finally:
+        _instance_lock_file.close()
+        _instance_lock_file = None
+
+
+atexit.register(release_instance_lock)
 
 def weekday_rus(value: date | datetime) -> str:
     dt = value if isinstance(value, datetime) else datetime.combine(value, time.min)
@@ -345,6 +384,12 @@ async def init_db() -> None:
                 registered_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS sent_notifications (
+                notification_key TEXT PRIMARY KEY,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         await db.commit()
 
 
@@ -404,6 +449,30 @@ async def get_users_count() -> int:
         count = await cursor.fetchone()
         await cursor.close()
         return count[0] if count else 0
+
+async def claim_notification(notification_key: str) -> bool:
+    """Атомарно резервирует уведомление и защищает от повторной отправки."""
+    async with aiosqlite.connect("users.db") as db:
+        try:
+            await db.execute(
+                "INSERT INTO sent_notifications (notification_key) VALUES (?)",
+                (notification_key,),
+            )
+            await db.commit()
+            return True
+        except aiosqlite.IntegrityError:
+            return False
+
+
+async def release_notification(notification_key: str) -> None:
+    """Разрешает повторную попытку, если отправка завершилась ошибкой."""
+    async with aiosqlite.connect("users.db") as db:
+        await db.execute(
+            "DELETE FROM sent_notifications WHERE notification_key=?",
+            (notification_key,),
+        )
+        await db.commit()
+
 
 def private_chat_only(func):
     @wraps(func)
@@ -1075,65 +1144,85 @@ async def cancel_yes_no_handler(update: Update, context: ContextTypes.DEFAULT_TY
 @registration_required
 async def remindme_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     uid = update.effective_user.id
-    current = remind_settings.get(uid, False)
-    remind_settings[uid] = not current
+    enabled = not remind_settings.get(uid, False)
+    remind_settings[uid] = enabled
 
-    status_str = "включены" if remind_settings[uid] else "выключены"
-    await update.message.reply_text(f"🔔 Персональные напоминания {status_str}.")
-
-    if remind_settings[uid]:
-        context.application.create_task(reminder_task(uid, context))
+    if enabled:
+        existing = reminder_tasks.get(uid)
+        if existing is None or existing.done():
+            task = context.application.create_task(
+                reminder_task(uid, context),
+                name=f"reminder:{uid}",
+            )
+            reminder_tasks[uid] = task
+        await update.message.reply_text("🔔 Персональные напоминания включены.")
+    else:
+        task = reminder_tasks.pop(uid, None)
+        if task and not task.done():
+            task.cancel()
+        await update.message.reply_text("🔕 Персональные напоминания выключены.")
 
 
 async def reminder_task(uid: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Фоновая задача персональных напоминаний."""
-    semaphore = asyncio.Semaphore(1)
+    """Одна фоновая задача персональных напоминаний на пользователя."""
     name = await get_user_name(uid)
     if not name:
+        remind_settings[uid] = False
+        reminder_tasks.pop(uid, None)
         return
-
-    sent_marks: set[str] = set()
 
     try:
         while remind_settings.get(uid, False):
-            async with semaphore:
-                now = datetime.now(MOSCOW_TZ)
-                data = await get_cached_data()
+            now = datetime.now(MOSCOW_TZ)
+            data = await get_cached_data()
 
-                for row_idx, row in enumerate(data[DATA_START_ROW - 1:], start=DATA_START_ROW):
-                    if not is_effective_lesson_row(row):
-                        continue
+            for row_idx, row in enumerate(data[DATA_START_ROW - 1:], start=DATA_START_ROW):
+                if not is_effective_lesson_row(row):
+                    continue
 
-                    lesson_date = safe_parse_date(row[2])
-                    lesson_time, teacher = parse_time_and_teacher(row[3])
+                lesson_date = safe_parse_date(row[2])
+                lesson_time, teacher = parse_time_and_teacher(row[3])
+                if not lesson_date or not lesson_time:
+                    continue
 
-                    if not lesson_date or not lesson_time:
-                        continue
+                places = row[PLACE_COL_START - 1:PLACE_COL_END]
+                if name not in places:
+                    continue
 
-                    places = row[PLACE_COL_START - 1:PLACE_COL_END]
-                    if name not in places:
-                        continue
+                lesson_datetime = combine_lesson_datetime(lesson_date, lesson_time)
+                diff = (lesson_datetime - now).total_seconds()
+                if not 14 * 60 <= diff <= 16 * 60:
+                    continue
 
-                    lesson_datetime = combine_lesson_datetime(lesson_date, lesson_time)
-                    diff = (lesson_datetime - now).total_seconds()
+                notification_key = (
+                    f"personal:{uid}:{row_idx}:{lesson_datetime.isoformat()}"
+                )
+                if not await claim_notification(notification_key):
+                    continue
 
-                    reminder_key = f"{uid}:{row_idx}:{lesson_datetime.isoformat()}"
+                text = (
+                    f"⏰ Напоминание: занятие начнётся через 15 минут "
+                    f"({lesson_date.strftime('%d.%m.%Y')} в {lesson_time.strftime('%H:%M')})"
+                )
+                if teacher:
+                    text += f" у {teacher}"
 
-                    if 14 * 60 <= diff <= 16 * 60 and reminder_key not in sent_marks:
-                        text = (
-                            f"⏰ Напоминание: занятие начнётся через 15 минут "
-                            f"({lesson_date.strftime('%d.%m.%Y')} в {lesson_time.strftime('%H:%M')})"
-                        )
-                        if teacher:
-                            text += f" у {teacher}"
+                try:
+                    await context.bot.send_message(chat_id=uid, text=text)
+                except Exception:
+                    await release_notification(notification_key)
+                    raise
 
-                        await context.bot.send_message(chat_id=uid, text=text)
-                        sent_marks.add(reminder_key)
+            await asyncio.sleep(30)
 
-                await asyncio.sleep(30)
-
+    except asyncio.CancelledError:
+        logger.info("Задача напоминаний пользователя %s остановлена", uid)
+        raise
     except Exception as e:
-        logger.error(f"Ошибка в reminder_task: {e}")
+        logger.exception("Ошибка в reminder_task пользователя %s: %s", uid, e)
+    finally:
+        reminder_tasks.pop(uid, None)
+
 
 @error_handler
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1412,20 +1501,25 @@ async def scheduled_send_morning(application: Application) -> None:
     today = datetime.now(MOSCOW_TZ).date()
     rows = await get_cached_data()
 
-    has_lessons = False
-    for row in rows[DATA_START_ROW - 1:]:
-        if not is_effective_lesson_row(row):
-            continue
-        lesson_date = safe_parse_date(row[2])
-        if lesson_date == today:
-            has_lessons = True
-            break
-
+    has_lessons = any(
+        is_effective_lesson_row(row) and safe_parse_date(row[2]) == today
+        for row in rows[DATA_START_ROW - 1:]
+    )
     if not has_lessons:
         logger.info("[scheduled_send_morning] Нет занятий, сообщение не отправлено.")
         return
 
-    await application.bot.send_message(chat_id=GROUP_CHAT_ID, text=MORNING_MESSAGE)
+    notification_key = f"group:morning:{today.isoformat()}"
+    if not await claim_notification(notification_key):
+        logger.warning("[scheduled_send_morning] Дубликат заблокирован: %s", notification_key)
+        return
+
+    try:
+        await application.bot.send_message(chat_id=GROUP_CHAT_ID, text=MORNING_MESSAGE)
+    except Exception:
+        await release_notification(notification_key)
+        raise
+
     logger.info("[scheduled_send_morning] Сообщение отправлено.")
 
 
@@ -1433,26 +1527,50 @@ async def scheduled_send_evening(application: Application) -> None:
     today = datetime.now(MOSCOW_TZ).date()
     rows = await get_cached_data()
 
-    row_data = None
-    for row in rows[DATA_START_ROW - 1:]:
-        if not is_effective_lesson_row(row):
-            continue
-        lesson_date = safe_parse_date(row[2])
-        if lesson_date == today:
-            row_data = row
-            break
-
+    row_data = next(
+        (
+            row
+            for row in rows[DATA_START_ROW - 1:]
+            if is_effective_lesson_row(row) and safe_parse_date(row[2]) == today
+        ),
+        None,
+    )
     if not row_data:
         logger.info("[scheduled_send_evening] Нет занятий, сообщение не отправлено.")
         return
 
+    notification_key = f"group:evening:{today.isoformat()}"
+    if not await claim_notification(notification_key):
+        logger.warning("[scheduled_send_evening] Дубликат заблокирован: %s", notification_key)
+        return
+
+
     val_n = get_price_from_row(row_data) or "Н/Д"
     evening_msg = f"Подводим итоги — по {val_n} р. Приносите наличными до конца недели."
-    await application.bot.send_message(chat_id=GROUP_CHAT_ID, text=evening_msg)
+    try:
+        await application.bot.send_message(chat_id=GROUP_CHAT_ID, text=evening_msg)
+    except Exception:
+        await release_notification(notification_key)
+        raise
+
     logger.info("[scheduled_send_evening] Сообщение отправлено.")
 
+
 async def start_scheduler(application: Application) -> None:
-    scheduler = AsyncIOScheduler(timezone=MOSCOW_TZ)
+    global scheduler
+
+    if scheduler is not None and scheduler.running:
+        logger.warning("APScheduler уже запущен — повторный запуск пропущен.")
+        return
+
+    scheduler = AsyncIOScheduler(
+        timezone=MOSCOW_TZ,
+        job_defaults={
+            "coalesce": True,
+            "max_instances": 1,
+            "misfire_grace_time": 300,
+        },
+    )
     scheduler.add_job(
         scheduled_send_morning,
         "cron",
@@ -1460,6 +1578,7 @@ async def start_scheduler(application: Application) -> None:
         minute=0,
         args=[application],
         id="morning_message",
+        replace_existing=True,
     )
     scheduler.add_job(
         scheduled_send_evening,
@@ -1468,22 +1587,50 @@ async def start_scheduler(application: Application) -> None:
         minute=0,
         args=[application],
         id="evening_message",
+        replace_existing=True,
     )
     scheduler.start()
-    logger.info("APScheduler запущен.")
+    logger.info("APScheduler запущен. Jobs: %s", [job.id for job in scheduler.get_jobs()])
 
 
 async def on_startup(application: Application) -> None:
     await init_db()
     await refresh_cache()
-    asyncio.create_task(background_cache_updater())
+
+    if application.bot_data.get("cache_updater_started"):
+        logger.warning("Фоновое обновление кэша уже запущено.")
+    else:
+        application.bot_data["cache_updater_started"] = True
+        application.create_task(background_cache_updater(), name="cache-updater")
+
     await start_scheduler(application)
 
+
+async def on_shutdown(application: Application) -> None:
+    global scheduler
+
+    for task in list(reminder_tasks.values()):
+        if not task.done():
+            task.cancel()
+    reminder_tasks.clear()
+
+    if scheduler is not None and scheduler.running:
+        scheduler.shutdown(wait=False)
+        scheduler = None
+        logger.info("APScheduler остановлен.")
+
+    _executor.shutdown(wait=False, cancel_futures=True)
+    release_instance_lock()
+
+
 def main() -> None:
+    acquire_instance_lock()
+
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
         .post_init(on_startup)
+        .post_shutdown(on_shutdown)
         .connect_timeout(60)
         .read_timeout(60)
         .write_timeout(60)
